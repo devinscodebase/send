@@ -1,0 +1,11 @@
+# Mailgun CLI Configuration
+# Copy this file to config.yml and customize for your needs
+
+# Default domain to use for sending emails
+default_domain: "example.com"
+
+# Default sender address (optional)
+default_from: "Marketing Team <marketing@example.com>"
+
+# Default mailing list name prefix (optional)
+default_list_name: "newsletter"
