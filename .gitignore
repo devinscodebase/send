@@ -75,3 +75,15 @@ scripts/
 test_*.rb
 debug_*.rb
 *_test.rb
+
+# Ignore sensitive and runtime files
+.env
+ domains.env
+profiles/
+scripts/
+*.log
+/tmp/
+/cache/
+# Keep sent/needtosend CSVs tracked
+!sent.csv
+!needtosend.csv

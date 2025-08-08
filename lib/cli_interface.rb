@@ -1,11 +1,17 @@
 require 'optparse'
 require 'tempfile'
-require_relative 'mailgun_client'
+require 'csv'
+require 'uri'
+require 'securerandom'
+require_relative 'resend_client'
 require_relative 'config_manager'
 require_relative 'csv_validator'
-require_relative 'time_parser'
+require_relative 'supabase_client'
 
 class CliInterface
+  BATCH_SIZE = 100 # Resend's maximum batch size
+  BATCH_DELAY = 0.6 # Delay between sending batches to stay under 2 RPS
+
   attr_reader :config, :client, :options
 
   def initialize
@@ -17,7 +23,7 @@ class CliInterface
   def run
     parse_arguments
     validate_configuration
-    setup_mailgun_client
+    setup_resend_client
     execute_workflow
   rescue Interrupt
     puts "\nOperation cancelled by user."
@@ -31,73 +37,31 @@ class CliInterface
 
   def setup_option_parser
     @option_parser = OptionParser.new do |opts|
-      opts.banner = 'Usage: mailgun_sender [options]'
+      opts.banner = 'Usage: resend_sender [options]'
       opts.separator ''
-      opts.separator 'Options:'
-
-      opts.on('--domain=DOMAIN', 'Mailgun domain to send from') do |v|
-        @options[:domain] = v
-      end
-
-      opts.on('--domain-key=KEY', 'API key for specific domain (if using domain sending key)') do |v|
-        @options[:domain_key] = v
-      end
-
-      opts.on('--csv=FILE', 'Path to contacts CSV file') do |v|
-        @options[:csv_file] = v
-      end
-
-      opts.on('--template=FILE', 'Path to HTML template file') do |v|
-        @options[:template_file] = v
-      end
-
-      opts.on('--from=EMAIL', 'From address (default: postmaster@domain)') do |v|
-        @options[:from_address] = v
-      end
-
-      opts.on('--subject=TEXT', 'Email subject line') do |v|
+      opts.separator 'Core Options:'
+      opts.on('--csv=FILE', 'Path to contacts CSV file (required)') { |v| @options[:csv_file] = v }
+      opts.on('--template=FILE', 'Path to HTML template file (required)') { |v| @options[:template_file] = v }
+      opts.on('--subject=TEXT',
+              '(Optional) Email subject line template. Defaults to loading from <template_name>_subject.txt') do |v|
         @options[:subject] = v
       end
-
-      opts.on('--send-at=TIME', "Scheduled send time (e.g. '2025-08-08 10:00 EST', 'tomorrow 9am')") do |v|
-        @options[:send_time] = v
-      end
-
-      opts.on('--list-name=NAME', 'Mailing list name (default: derived from CSV filename)') do |v|
-        @options[:list_name] = v
-      end
-
-      opts.on('--test', 'Enable test mode (no actual send)') do
-        @options[:test_mode] = true
-      end
-
-      opts.on('--dry-run', 'Show what would be done without making API calls') do
-        @options[:dry_run] = true
-      end
-
-      opts.on('--max-threads=NUM', Integer, 'Maximum parallel threads (default: 5)') do |v|
-        @options[:max_threads] = v
-      end
-
-      opts.on('--delay=SECONDS', Float, 'Delay between requests in seconds (default: 0.1)') do |v|
-        @options[:delay_between_requests] = v
-      end
-
-      opts.on('--config=FILE', 'Path to configuration file') do |v|
-        @options[:config_file] = v
-      end
-
-      opts.on('-v', '--verbose', 'Enable verbose output') do
-        @options[:verbose] = true
-      end
-
+      opts.separator ''
+      opts.separator 'Sender Selection:'
+      opts.on('--focus=TEXT', 'Select sender by focus (e.g., "Higher Education")') { |v| @options[:focus] = v }
+      opts.on('--sender-email=EMAIL', 'Select sender by email (requires --focus)') { |v| @options[:sender_email] = v }
+      opts.separator ''
+      opts.separator 'Sending Options:'
+      opts.on('--yes', 'Auto-confirm send without prompt') { @options[:yes] = true }
+      opts.on('--dry-run', 'Show summary and exit without sending') { @options[:dry_run] = true }
+      opts.separator ''
+      opts.separator 'General Options:'
       opts.on('-h', '--help', 'Show this help message') do
         puts opts
         exit
       end
-
       opts.on('--version', 'Show version') do
-        puts 'Mailgun CLI Bulk Email Sender v1.0.0'
+        puts 'Resend CLI Sender v1.5.0 (Campaign UUID Mode)'
         exit
       end
     end
@@ -105,389 +69,225 @@ class CliInterface
 
   def parse_arguments
     @option_parser.parse!(into: @options)
-  rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
-    puts "Error: #{e.message}"
-    puts @option_parser
-    exit 1
+    unless @options[:csv_file] && @options[:template_file]
+      puts 'Error: --csv and --template are required.'
+      puts @option_parser
+      exit 1
+    end
   end
 
   def validate_configuration
     errors = @config.validate_required_fields
     unless errors.empty?
-      puts 'Configuration errors:'
-      errors.each { |error| puts "  - #{error}" }
+      puts "Configuration Error: #{errors.join(', ')}"
       exit 1
     end
   end
 
-  def setup_mailgun_client
-    @client = MailgunClient.new(@config.api_key, @config.base_url)
+  def setup_resend_client
+    @client = ResendClient.new(@config.api_key)
   end
 
   def execute_workflow
-    puts '🚀 Mailgun CLI Bulk Email Sender'
+    puts '🚀 Resend CLI Bulk Email Sender (Campaign UUID Mode)'
     puts '=' * 50
 
-    # Gather all required information
-    domain = get_domain
-    csv_file = get_csv_file
-    template_file = get_template_file
-    from_address = get_from_address(domain)
-    subject = get_subject
-    send_time = get_send_time
-    list_name = get_list_name(csv_file)
-    test_mode = get_test_mode
+    campaign_id = SecureRandom.uuid
+    sender = select_sender_via_supabase
+    from_address = "#{sender['first_name']} #{sender['last_name']} <#{sender['email_address']}>"
+    subject_template = load_subject_line
 
-    # Validate CSV
     puts "\n📋 Validating CSV file..."
-    csv_validator = CsvValidator.new(csv_file)
-    unless csv_validator.validate_and_parse
-      puts 'CSV validation failed:'
-      csv_validator.errors.each { |error| puts "  ❌ #{error}" }
-      exit 1
-    end
+    csv_validator = CsvValidator.new(@options[:csv_file])
+    csv_validator.validate_and_parse
+    puts "✅ Found #{csv_validator.valid_contact_count} valid contacts."
 
-    puts '✅ CSV validation successful'
-    puts "   Total contacts: #{csv_validator.contact_count}"
-    puts "   Valid contacts: #{csv_validator.valid_contact_count}"
-    puts "   Invalid contacts: #{csv_validator.invalid_contact_count}"
-
-    if csv_validator.invalid_contact_count.positive?
-      puts "\n⚠️  Warnings:"
-      csv_validator.warnings.each { |warning| puts "  ⚠️  #{warning}" }
-    end
-
-    # Load template
     puts "\n📄 Loading email template..."
-    html_content = load_template(template_file)
-    puts "✅ Template loaded (#{html_content.length} characters)"
+    html_content = File.read(@options[:template_file])
+    puts '✅ Template loaded.'
 
-    # Generate valid CSV for upload
-    valid_csv_path = generate_valid_csv(csv_validator)
-
-    # Summary and confirmation
-    show_summary(domain, list_name, csv_validator.valid_contact_count, from_address, subject, send_time, test_mode)
-
+    show_summary(from_address, sender['domain_name'], csv_validator.valid_contact_count, subject_template, campaign_id)
+    exit 0 if @options[:dry_run]
     unless confirm_operation
       puts 'Operation cancelled.'
       exit 0
     end
 
-    # Execute the send operation
-    if @options[:dry_run]
-      perform_dry_run(domain, list_name, valid_csv_path, from_address, subject, html_content, send_time, test_mode)
-    else
-      perform_send(domain, list_name, valid_csv_path, from_address, subject, html_content, send_time, test_mode)
-    end
+    perform_batch_send(from_address, csv_validator.contacts, subject_template, html_content, sender, campaign_id)
+
+    puts "\n🏷️ Campaign UUID for tracking: #{campaign_id}"
   end
 
-  def get_domain
-    if @options[:domain]
-      # If domain is specified via command line, try to get its key
-      if @config.domain_keys[@options[:domain]]
-        @options[:domain_key] = @config.domain_keys[@options[:domain]]
-        puts "✅ Using domain-specific API key for #{@options[:domain]}"
-      end
-      return @options[:domain]
-    end
-    return @config.domain if @config.domain
-
-    # Check if we have domains from domains.env
-    if @config.domains.any?
-      puts "\n🌐 Available domains from configuration:"
-      @config.domains.each_with_index do |domain, index|
-        has_key = @config.domain_keys[domain] ? '✅' : '❌'
-        puts "  [#{index + 1}] #{domain} #{has_key}"
-      end
-
-      print "Select domain (1-#{@config.domains.length}): "
-      choice = gets.chomp.to_i
-
-      if choice < 1 || choice > @config.domains.length
-        puts 'Invalid selection.'
-        exit 1
-      end
-
-      selected_domain = @config.domains[choice - 1]
-
-      # Set the domain-specific API key if available
-      if @config.domain_keys[selected_domain]
-        @options[:domain_key] = @config.domain_keys[selected_domain]
-        puts "✅ Using domain-specific API key for #{selected_domain}"
-      else
-        puts "⚠️  No domain-specific API key found for #{selected_domain}"
-      end
-
-      return selected_domain
-    end
-
-    # Fallback to fetching from Mailgun API
-    puts "\n🌐 Fetching available domains from Mailgun API..."
-    begin
-      domains = @client.list_domains
-      if domains.empty?
-        puts '❌ No domains found in your Mailgun account.'
-        exit 1
-      end
-
-      puts 'Available domains:'
-      domains.each_with_index do |domain, index|
-        puts "  [#{index + 1}] #{domain['name']}"
-      end
-
-      print "Select domain (1-#{domains.length}): "
-      choice = gets.chomp.to_i
-
-      if choice < 1 || choice > domains.length
-        puts 'Invalid selection.'
-        exit 1
-      end
-
-      domains[choice - 1]['name']
-    rescue MailgunError => e
-      puts "❌ Failed to fetch domains: #{e.message}"
-      puts '💡 Tip: You can configure domains in domains.env file'
-      exit 1
-    end
-  end
-
-  def get_csv_file
-    return @options[:csv_file] if @options[:csv_file]
-
-    print 'Enter path to contacts CSV file: '
-    file_path = gets.chomp.strip
-
-    unless File.exist?(file_path)
-      puts "❌ File not found: #{file_path}"
-      exit 1
-    end
-
-    file_path
-  end
-
-  def get_template_file
-    return @options[:template_file] if @options[:template_file]
-
-    print 'Enter path to HTML template file: '
-    file_path = gets.chomp.strip
-
-    unless File.exist?(file_path)
-      puts "❌ File not found: #{file_path}"
-      exit 1
-    end
-
-    file_path
-  end
-
-  def get_from_address(domain)
-    from_address = @options[:from_address] || @config.from_address
-
-    if from_address.nil?
-      default_from = "postmaster@#{domain}"
-      print "Enter sender email (or press Enter for #{default_from}): "
-      from_address = gets.chomp.strip
-      from_address = default_from if from_address.empty?
-    end
-
-    # Add sender name for specific domains
-    if from_address.include?('retirementaid.org')
-      from_address = "Grant Walker <#{from_address}>"
-    elsif from_address.include?('pensionaid.org')
-      from_address = "Grant Walker <#{from_address}>"
-    end
-
-    from_address
-  end
-
-  def get_subject
+  def load_subject_line
     return @options[:subject] if @options[:subject]
 
-    print 'Enter email subject: '
-    subject = gets.chomp.strip
-
-    if subject.empty?
-      puts '❌ Subject is required.'
-      exit 1
+    template_path = @options[:template_file]
+    subject_path = template_path.gsub(/\.html$/, '_subject.txt')
+    unless File.exist?(subject_path)
+      raise "Error: Subject not provided and default subject file not found at '#{subject_path}'"
     end
 
-    subject
+    puts "✅ Loaded subject template from '#{subject_path}'"
+    File.read(subject_path).strip
   end
 
-  def get_send_time
-    return @options[:send_time] if @options[:send_time]
+  def select_sender_via_supabase
+    sb = SupabaseClient.new
+    focuses = ['Higher Education', 'School Districts', 'Federal Government', 'Internal Marketing', 'Client Marketing']
+    if @options[:focus]
+      focus = @options[:focus]
+      senders = sb.list_senders(focus: focus)
+    else
+      puts "\nFocus? Choose one:"
+      focuses.each_with_index { |f, i| puts "  #{i + 1}) #{f}" }
+      print 'Enter 1-5: '
+      choice = STDIN.gets.to_i
+      focus = focuses[choice - 1]
+      raise 'Invalid choice.' unless focus
 
-    print "Enter send date/time (e.g. '2025-08-08 10:00 EST', 'tomorrow 9am', or 'now'): "
-    time_string = gets.chomp.strip
-
-    return nil if time_string.empty?
-
-    begin
-      TimeParser.parse_schedule_time(time_string)
-    rescue TimeParseError => e
-      puts "❌ #{e.message}"
-      exit 1
+      senders = sb.list_senders(focus: focus)
     end
-  end
-
-  def get_list_name(csv_file)
-    return @options[:list_name] if @options[:list_name]
-    return @config.list_name if @config.list_name
-
-    # Derive from CSV filename
-    base_name = File.basename(csv_file, '.*')
-    list_name = base_name.gsub(/[^a-zA-Z0-9_-]/, '_').downcase
-
-    print "Enter mailing list name (or press Enter for '#{list_name}'): "
-    user_list_name = gets.chomp.strip
-
-    user_list_name.empty? ? list_name : user_list_name
-  end
-
-  def get_test_mode
-    return @options[:test_mode] if @options.key?(:test_mode)
-
-    print 'Test mode? (y/N): '
-    response = gets.chomp.strip.downcase
-
-    %w[y yes].include?(response)
-  end
-
-  def load_template(template_file)
-    content = File.read(template_file)
-    content.force_encoding('UTF-8')
-
-    content
-  rescue StandardError => e
-    puts "❌ Failed to load template: #{e.message}"
-    exit 1
-  end
-
-  def generate_valid_csv(csv_validator)
-    valid_contacts = csv_validator.contacts.select { |contact| contact[:valid] }
-
-    temp_file = Tempfile.new(['valid_contacts', '.csv'])
-    CSV.open(temp_file.path, 'w') do |csv|
-      csv << %w[address firstname lastname company]
-      valid_contacts.each do |contact|
-        csv << [contact[:email], contact[:firstname] || '', contact[:lastname] || '', contact[:company] || '']
+    if senders.empty?
+      puts "No senders found for focus '#{focus}'. Fetching all senders as a fallback..."
+      senders = sb.list_senders
+      raise 'No senders found in Supabase at all.' if senders.empty?
+    end
+    if @options[:sender_email]
+      sender = senders.find { |s| s['email_address'].casecmp?(@options[:sender_email]) }
+      raise "Sender with email '#{@options[:sender_email]}' not found for the selected focus." unless sender
+    else
+      puts "\nAvailable senders:"
+      senders.each_with_index do |s, i|
+        puts "  [#{i + 1}] #{s['first_name']} #{s['last_name']} <#{s['email_address']}>"
       end
+      print "Select sender (1-#{senders.length}): "
+      choice = STDIN.gets.to_i
+      sender = senders[choice - 1]
+      raise 'Invalid selection.' unless sender
     end
-
-    temp_file.path
+    puts "✅ Selected sender: #{sender['first_name']} #{sender['last_name']}"
+    sender
   end
 
-  def show_summary(domain, list_name, contact_count, from_address, subject, send_time, test_mode)
+  def show_summary(from_address, domain, recipient_count, subject_template, campaign_id)
     puts "\n#{'=' * 50}"
     puts '📧 EMAIL SEND SUMMARY'
     puts '=' * 50
-    puts "Domain: #{domain}"
-    puts "Mailing List: #{list_name}@#{domain}"
-    puts "Recipients: #{contact_count}"
     puts "From: #{from_address}"
-    puts "Subject: #{subject}"
-    puts "Scheduled: #{send_time || 'Send immediately'}"
-    puts "Test Mode: #{test_mode ? 'Yes' : 'No'}"
+    puts "Domain: #{domain}"
+    puts "Recipients: #{recipient_count}"
+    puts "Subject Template: #{subject_template}"
+    puts "Campaign ID: #{campaign_id}"
+    puts "Dry Run: #{@options[:dry_run] ? 'Yes' : 'No'}"
     puts '=' * 50
   end
 
   def confirm_operation
+    return true if @options[:yes]
+
     print "\nProceed with sending? (y/N): "
-    response = gets.chomp.strip.downcase
-
-    %w[y yes].include?(response)
+    STDIN.gets.strip.casecmp?('y')
   end
 
-  def perform_dry_run(domain, _list_name, csv_file, from_address, subject, html_content, send_time, test_mode)
-    puts "\n🔍 DRY RUN MODE - No actual API calls will be made"
-    puts '=' * 50
+  def personalize_text(text, recipient)
+    return text unless text.include?('%')
 
-    # Count recipients
-    recipient_count = CSV.read(csv_file).count - 1
-
-    puts "Would send emails directly to #{recipient_count} recipients from: #{csv_file}"
-    puts "Would send email with subject: #{subject}"
-    puts "From: #{from_address}"
-    puts "Domain: #{domain}"
-    puts "Scheduled: #{send_time || 'Send immediately'}"
-    puts "Test Mode: #{test_mode ? 'Yes' : 'No'}"
-    puts "Template size: #{html_content.length} characters"
-
-    puts "\n✅ Dry run completed successfully!"
+    personalized = text.dup
+    personalized.gsub!('%recipient.first%', recipient[:firstname] || '')
+    personalized.gsub!('%recipient.last%', recipient[:lastname] || '')
+    personalized.gsub!('%recipient.name%', "#{recipient[:firstname]} #{recipient[:lastname]}".strip)
+    personalized.gsub!('%recipient.company%', recipient[:company] || '')
+    personalized.gsub!('%recipient.email%', recipient[:email] || '')
+    personalized
   end
 
-  def perform_send(domain, _list_name, csv_file, from_address, subject, html_content, send_time, test_mode)
-    puts "\n📤 Starting email send process..."
-    puts '=' * 50
+  def personalize_html(html_content, recipient, sender, template_name, campaign_id)
+    personalized = personalize_text(html_content, recipient)
+    personalized.gsub!('%sender.name%', "#{sender['first_name']} #{sender['last_name']}")
+    personalized.gsub!('%sender.title%', 'Financial Advisor')
+    personalized.gsub!('%sender.email%', sender['email_address'])
+    personalized.gsub!('%sender.profile_picture%', sender['profile_picture_url'])
+    update_calendly_link(personalized, template_name, campaign_id)
+    personalized
+  end
 
-    # Load recipients from CSV
-    puts '📋 Loading recipients from CSV...'
-    recipients = []
-    CSV.foreach(csv_file, headers: true) do |row|
-      email = row['email'] || row['Email'] || row['EMAIL'] || row['address'] || row['Address']
-      firstname = row['firstname'] || row['Firstname'] || row['FIRSTNAME'] || row['first_name'] || row['First Name']
-      lastname = row['lastname'] || row['Lastname'] || row['LASTNAME'] || row['last_name'] || row['Last Name']
-      company = row['company'] || row['Company'] || row['COMPANY']
+  def update_calendly_link(html_content, template_name, campaign_id)
+    html_content.gsub!(%r{(https://calendly\.com/[^\s"']+)}) do |match|
+      uri = URI.parse(match)
+      params = URI.decode_www_form(uri.query || '').to_h
+      params['utm_source'] = 'RS'
+      params['utm_content'] = template_name.gsub(/\.html$/, '')
+      params['utm_campaign'] = campaign_id
+      uri.query = URI.encode_www_form(params)
+      uri.to_s
+    end
+  end
 
-      # Fallback to old 'name' format if firstname/lastname not found
-      if firstname.nil? && lastname.nil?
-        name = row['name'] || row['Name'] || row['NAME']
-        if name
-          name_parts = name.split(' ', 2)
-          firstname = name_parts[0]
-          lastname = name_parts[1] || ''
+  def write_results_to_csv(results)
+    sent_path = 'sent.csv'
+    failed_path = 'failed_to_send.csv'
+
+    CSV.open(sent_path, 'w') do |csv|
+      csv << ['email']
+      results.select { |r| r[:success] }.each { |r| csv << [r[:email]] }
+    end
+
+    CSV.open(failed_path, 'w') do |csv|
+      csv << %w[email error]
+      results.reject { |r| r[:success] }.each { |r| csv << [r[:email], r[:error]] }
+    end
+
+    puts "\n💾 Results saved:"
+    puts "   - Sent log: #{sent_path}"
+    puts "   - Failed log: #{failed_path}"
+  end
+
+  def perform_batch_send(from_address, contacts, subject_template, html_template, sender, campaign_id)
+    puts "\n📤 Preparing emails for batch sending..."
+    template_name = File.basename(@options[:template_file])
+    valid_contacts = contacts.select { |c| c[:valid] }
+    all_results = []
+
+    email_payloads = valid_contacts.map do |contact|
+      {
+        from: from_address,
+        to: contact[:email],
+        subject: personalize_text(subject_template, contact),
+        html: personalize_html(html_template, contact, sender, template_name, campaign_id)
+      }
+    end
+
+    total_emails = email_payloads.length
+    total_batches = (total_emails / BATCH_SIZE.to_f).ceil
+
+    email_payloads.each_slice(BATCH_SIZE).with_index do |batch, index|
+      puts "📦 Sending batch #{index + 1} of #{total_batches} (#{batch.length} emails)..."
+      begin
+        response = @client.send_batch(batch)
+        if response && response[:data]
+          puts "✅ Batch #{index + 1} accepted by API. #{response[:data].length} emails created."
+          batch.each { |payload| all_results << { email: payload[:to], success: true } }
+        else
+          puts "❌ Batch #{index + 1} failed: Unexpected API response."
+          batch.each do |payload|
+            all_results << { email: payload[:to], success: false, error: 'Unexpected API response' }
+          end
         end
+      rescue ResendClient::ResendError => e
+        puts "❌ Batch #{index + 1} failed: #{e.message}"
+        batch.each { |payload| all_results << { email: payload[:to], success: false, error: e.message } }
       end
-
-      if email && !email.strip.empty?
-        recipients << {
-          email: email.strip,
-          firstname: firstname&.strip || '',
-          lastname: lastname&.strip || '',
-          company: company&.strip
-        }
-        full_name = [firstname&.strip, lastname&.strip].compact.join(' ')
-        puts "  📧 #{email.strip} (#{full_name || 'No name'})"
-      else
-        puts '  ⚠️  Skipping row with empty email'
-      end
+      sleep(BATCH_DELAY) if index < total_batches - 1
     end
 
-    puts "✅ Loaded #{recipients.length} recipients"
+    successful_sends = all_results.count { |r| r[:success] }
+    failed_sends = all_results.size - successful_sends
 
-    # Send emails directly to each recipient
-    puts '📧 Sending emails to individual recipients...'
-    begin
-      send_options = {}
-      send_options[:delivery_time] = send_time if send_time
-      send_options[:test_mode] = test_mode
-      send_options[:domain_key] = @options[:domain_key] if @options[:domain_key]
-      send_options[:max_threads] = @options[:max_threads] if @options[:max_threads]
-      send_options[:delay_between_requests] = @options[:delay_between_requests] if @options[:delay_between_requests]
+    puts "\n📊 Sending Summary:"
+    puts "   ✅ Successful: #{successful_sends}"
+    puts "   ❌ Failed:     #{failed_sends}"
 
-      results = @client.send_bulk_emails(domain, from_address, recipients, subject, html_content, send_options)
-
-      # Summary
-      successful = results.count { |r| r[:success] }
-      failed = results.count { |r| !r[:success] }
-
-      puts "\n📊 Sending Summary:"
-      puts "   ✅ Successful: #{successful}"
-      puts "   ❌ Failed: #{failed}"
-      puts "   📧 Total: #{results.length}"
-
-      if test_mode
-        puts 'ℹ️  Test mode enabled - no actual emails were sent'
-      end
-
-      if send_time
-        puts "⏰ Emails scheduled for: #{send_time}"
-      end
-    rescue MailgunError => e
-      puts "❌ Failed to send emails: #{e.message}"
-      exit 1
-    end
-
-    puts "\n🎉 Email campaign completed successfully!"
-    puts 'You can monitor delivery status on your Mailgun dashboard.'
+    write_results_to_csv(all_results) if total_emails > 0
+    puts "\n🎉 Email campaign completed!"
   end
 end
